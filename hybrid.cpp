@@ -8,7 +8,8 @@
 #include <algorithm>
 #include <climits>
 #include <ctime>
-#include <omp.h>  // Include OpenMP
+#include <omp.h>
+#include <mpi.h>
 
 using namespace std;
 
@@ -20,6 +21,7 @@ struct SSSPResult {
     vector<int> parent;
 };
 
+// Dijkstra (only rank 0 computes)
 SSSPResult dijkstra(const vector<vector<pair<int, int>>>& adj, int start) {
     int n = adj.size() - 1;
     SSSPResult result;
@@ -48,7 +50,7 @@ SSSPResult dijkstra(const vector<vector<pair<int, int>>>& adj, int start) {
     return result;
 }
 
-// Parallel version of SSSP update
+// Parallel update helper
 bool SSSP(int z, const vector<vector<pair<int, int>>>& adj, SSSPResult& result) {
     bool updated = false;
 
@@ -87,18 +89,18 @@ void singleChange(char change_type, int u, int v, int weight,
     priority_queue<PQElement, vector<PQElement>, greater<PQElement>> pq;
 
     if (change_type == 'I') {
-        adj[u].emplace_back(v, weight);
+    adj[u].emplace_back(v, weight);
+    cout << "Inserting edge " << u << " -> " << v << " with weight " << weight << endl;
 
-        if (result.dist[y] != INF && result.dist[x] > result.dist[y] + weight) {
-            result.dist[x] = result.dist[y] + weight;
-            result.parent[x] = y;
-            cout << "Inserting edge " << u << " -> " << v << " with weight " << weight
-                 << " as it provides a shorter path.\n";
-        } else {
-            cout << "Skipping edge " << u << " -> " << v << " with weight " << weight
-                 << " as it doesn't offer a shorter path.\n";
-        }
-    } else if (change_type == 'D') {
+    if (result.dist[y] != INF && result.dist[x] > result.dist[y] + weight) {
+        result.dist[x] = result.dist[y] + weight;
+        result.parent[x] = y;
+        cout << "Edge " << u << " -> " << v << " provides a shorter path. Updating distance.\n";
+    } else {
+        cout << "Skipping edge " << u << " -> " << v
+             << " as it does not provide a shorter path.\n";
+    }
+} else if (change_type == 'D') {
         auto& edges = adj[u];
         edges.erase(remove_if(edges.begin(), edges.end(),
                    [v](const pair<int, int>& p) { return p.first == v; }),
@@ -119,7 +121,6 @@ void singleChange(char change_type, int u, int v, int weight,
         bool updated = SSSP(z, adj, result);
 
         if (updated) {
-            // Parallelize neighbor pushing
             #pragma omp parallel for
             for (int i = 0; i < adj[z].size(); ++i) {
                 #pragma omp critical
@@ -150,81 +151,100 @@ void displayShortestPaths(int start_node, int nrows, const SSSPResult& result, o
 }
 
 int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
     if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <graph.mtx>\n";
+        if (rank == 0)
+            cerr << "Usage: " << argv[0] << " <graph.mtx>\n";
+        MPI_Finalize();
         return 1;
     }
 
-    ofstream outfile("output.txt");
-    if (!outfile) {
-        cerr << "Error opening output file\n";
-        return 1;
-    }
+    vector<vector<pair<int, int>>> adj;
+    int nrows = 0;
+    SSSPResult result;
+    int start_node = 1;
 
-    ifstream infile(argv[1]);
-    if (!infile) {
-        cerr << "Cannot open graph file\n";
-        return 1;
-    }
-
-    string line;
-    int nrows = 0, ncols = 0, nentries = 0;
-    while (getline(infile, line)) {
-        if (line[0] == '%') continue;
-        istringstream iss(line);
-        if (!(iss >> nrows >> ncols >> nentries)) {
-            cerr << "Error reading graph dimensions\n";
+    if (rank == 0) {
+        ifstream infile(argv[1]);
+        if (!infile) {
+            cerr << "Cannot open graph file\n";
+            MPI_Finalize();
             return 1;
         }
-        break;
-    }
 
-    vector<vector<pair<int, int>>> adj(nrows + 1);
-    int u, v, w;
-    while (infile >> u >> v >> w) {
-        if (u < 1 || u > nrows || v < 1 || v > nrows) continue;
-        adj[u].emplace_back(v, w);
-    }
-
-    int start_node = 1;
-    outfile << "Initial SSSP from node " << start_node << ":\n";
-    double start_time = omp_get_wtime();
-
-    SSSPResult result = dijkstra(adj, start_node);
-    displayShortestPaths(start_node, nrows, result, outfile);
-
-    double end_time = omp_get_wtime();
-    outfile << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
-    cout << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
-
-    ifstream changes_file("changes.txt");
-    vector<tuple<char, int, int, int>> edgeChanges;
-    string change_line;
-    while (getline(changes_file, change_line)) {
-        if (change_line.empty() || change_line[0] == '%') continue;
-        istringstream iss(change_line);
-        char type;
-        if (iss >> type >> u >> v >> w) {
-            edgeChanges.emplace_back(type, u, v, w);
+        string line;
+        int ncols = 0, nentries = 0;
+        while (getline(infile, line)) {
+            if (line[0] == '%') continue;
+            istringstream iss(line);
+            if (!(iss >> nrows >> ncols >> nentries)) {
+                cerr << "Error reading graph dimensions\n";
+                MPI_Finalize();
+                return 1;
+            }
+            break;
         }
+
+        adj.resize(nrows + 1);
+        int u, v, w;
+        while (infile >> u >> v >> w) {
+            if (u < 1 || u > nrows || v < 1 || v > nrows) continue;
+            adj[u].emplace_back(v, w);
+        }
+
+        double start_time = omp_get_wtime();
+        result = dijkstra(adj, start_node);
+        double end_time = omp_get_wtime();
+
+        ofstream outfile("output.txt");
+        outfile << "Initial SSSP from node " << start_node << ":\n";
+        displayShortestPaths(start_node, nrows, result, outfile);
+        outfile << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
+        cout << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
     }
 
-    outfile << "\nProcessing changes incrementally...\n";
-    start_time = omp_get_wtime();
+    // Broadcast nrows to all processes
+    MPI_Bcast(&nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    for (const auto& change : edgeChanges) {
-        auto [type, u, v, w] = change;
-        outfile << "\nProcessing " << (type == 'D' ? "Deletion" : "Insertion")
-                << " of edge " << u << "->" << v << " (weight: " << w << ")\n";
+    // Each process prepares their own adj/res arrays as needed
+    // NOTE: For now, only rank 0 handles full processing. You can enhance this by parallelizing change processing across ranks.
 
-        singleChange(type, u, v, w, adj, result);
+    if (rank == 0) {
+        ifstream changes_file("changes.txt");
+        vector<tuple<char, int, int, int>> edgeChanges;
+        string change_line;
+        int u, v, w;
+        char type;
+
+        while (getline(changes_file, change_line)) {
+            if (change_line.empty() || change_line[0] == '%') continue;
+            istringstream iss(change_line);
+            if (iss >> type >> u >> v >> w) {
+                edgeChanges.emplace_back(type, u, v, w);
+            }
+        }
+
+        double start_time = omp_get_wtime();
+
+        for (const auto& change : edgeChanges) {
+            tie(type, u, v, w) = change;
+            singleChange(type, u, v, w, adj, result);
+        }
+
+        double end_time = omp_get_wtime();
+
+        ofstream outfile("output.txt", ios::app);
+        outfile << "\nFinal SSSP after changes:\n";
+        displayShortestPaths(start_node, nrows, result, outfile);
+        outfile << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
+        cout << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
     }
 
-    end_time = omp_get_wtime();
-    outfile << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
-    cout << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
-
-    outfile << "\nFinal SSSP after changes:\n";
-    displayShortestPaths(start_node, nrows, result, outfile);
+    MPI_Finalize();
     return 0;
 }
