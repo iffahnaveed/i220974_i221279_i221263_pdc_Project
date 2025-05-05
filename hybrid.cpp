@@ -50,11 +50,11 @@ SSSPResult dijkstra(const vector<vector<pair<int, int>>>& adj, int start) {
     return result;
 }
 
-// Parallel update helper
+// Parallel update helper with OpenMP load balancing
 bool SSSP(int z, const vector<vector<pair<int, int>>>& adj, SSSPResult& result) {
     bool updated = false;
 
-    #pragma omp parallel for shared(result, adj, updated)
+    #pragma omp parallel for schedule(dynamic)
     for (int u = 1; u < adj.size(); ++u) {
         for (const auto& [v, weight] : adj[u]) {
             if (v == z && result.dist[u] != INF) {
@@ -89,18 +89,18 @@ void singleChange(char change_type, int u, int v, int weight,
     priority_queue<PQElement, vector<PQElement>, greater<PQElement>> pq;
 
     if (change_type == 'I') {
-    adj[u].emplace_back(v, weight);
-    cout << "Inserting edge " << u << " -> " << v << " with weight " << weight << endl;
+        adj[u].emplace_back(v, weight);
+        cout << "Inserting edge " << u << " -> " << v << " with weight " << weight << endl;
 
-    if (result.dist[y] != INF && result.dist[x] > result.dist[y] + weight) {
-        result.dist[x] = result.dist[y] + weight;
-        result.parent[x] = y;
-        cout << "Edge " << u << " -> " << v << " provides a shorter path. Updating distance.\n";
-    } else {
-        cout << "Skipping edge " << u << " -> " << v
-             << " as it does not provide a shorter path.\n";
-    }
-} else if (change_type == 'D') {
+        if (result.dist[y] != INF && result.dist[x] > result.dist[y] + weight) {
+            result.dist[x] = result.dist[y] + weight;
+            result.parent[x] = y;
+            cout << "Edge " << u << " -> " << v << " provides a shorter path. Updating distance.\n";
+        } else {
+            cout << "Skipping edge " << u << " -> " << v
+                 << " as it does not provide a shorter path.\n";
+        }
+    } else if (change_type == 'D') {
         auto& edges = adj[u];
         edges.erase(remove_if(edges.begin(), edges.end(),
                    [v](const pair<int, int>& p) { return p.first == v; }),
@@ -118,10 +118,10 @@ void singleChange(char change_type, int u, int v, int weight,
         auto [_, z] = pq.top();
         pq.pop();
 
-        bool updated = SSSP(z, adj, result);
+        bool local_updated = SSSP(z, adj, result);
 
-        if (updated) {
-            #pragma omp parallel for
+        if (local_updated) {
+            #pragma omp parallel for schedule(dynamic)
             for (int i = 0; i < adj[z].size(); ++i) {
                 #pragma omp critical
                 pq.push({result.dist[adj[z][i].first], adj[z][i].first});
@@ -207,13 +207,10 @@ int main(int argc, char* argv[]) {
         outfile << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
         cout << "Execution time for initial SSSP: " << (end_time - start_time) << " seconds\n";
     }
-
-    // Broadcast nrows to all processes
+MPI_Barrier(MPI_COMM_WORLD);
     MPI_Bcast(&nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    // Each process prepares their own adj/res arrays as needed
-    // NOTE: For now, only rank 0 handles full processing. You can enhance this by parallelizing change processing across ranks.
-
+    MPI_Barrier(MPI_COMM_WORLD);
+    // Only rank 0 processes updates; enhanced parallel processing can be added later across ranks
     if (rank == 0) {
         ifstream changes_file("changes.txt");
         vector<tuple<char, int, int, int>> edgeChanges;
@@ -244,7 +241,7 @@ int main(int argc, char* argv[]) {
         outfile << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
         cout << "Execution time for incremental updates: " << (end_time - start_time) << " seconds\n";
     }
-
+MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
     return 0;
 }
